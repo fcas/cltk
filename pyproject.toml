@@ -72,7 +72,7 @@ rtd-poetry = "^0.1.0"
 sphinx-autodoc-typehints = "^1.17"
 pre-commit = "3.6.0"
 mypy = "^1.8.0"
-lxml = "^4.9"
+lxml = "^5.3"
 black = "^23.12.1"
 isort = "^5.13.2"
 
