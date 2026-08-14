@@ -1,2 +1,0 @@
-"""Middle High German phonology
-"""

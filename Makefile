@@ -1,98 +1,117 @@
+SHELL := /usr/bin/env bash
+
 build:
-	poetry build
+	uv build
 
 docs:
-	# typed_ast crashes ``sphinx-autodoc-typehints``; is dependency of ``mypy``, however not required for py3.8 and above
-	pip uninstall -y typed_ast && poetry run sphinx-apidoc --force --output-dir=docs --module-first src/cltk && cd docs && poetry run make html && cd ..
+	@echo "Building MkDocs site..."
+	uv run mkdocs build --strict
 
-downloadAllModels:
-	poetry run python scripts/download_all_models.py
+docsServe:
+	@echo "Serving MkDocs site at http://127.0.0.1:8000 ..."
+	uv run mkdocs serve -a 127.0.0.1:8000
+
+fix:
+	uv run ruff check --fix src/
 
 format:
-	poetry run isort --profile black src/cltk tests docs scripts && poetry run black src/cltk tests docs scripts
+	uv run ruff format src/ tests/ scripts/ evaluation/
 
 freezeDependencies:
-	# Update lock file from pyptoject.toml, but do not install the changed/added packages
-	poetry lock
+	# Update uv.lock from pyproject.toml without installing packages
+	uv lock
 
 install:
-	echo "Excluding ``[tool.poetry.dev-dependencies]`` in ``pyproject.toml``"
-	poetry install --only main
+	uv sync --no-default-groups --frozen
+
+installOptionals:
+# 	uv sync --no-default-groups --extra openai --extra stanza --extra ollama --extra mistral --frozen
+	uv sync --all-extras
 
 installDev:
-	# Including ``[tool.poetry.dev-dependencies]`` in ``pyproject.toml``
-	poetry install
-
-installLegacy:
-	# For cltk v. 0.1
-	python setup.py install
+	uv sync --frozen
 
 installPyPI:
-	poetry run pip install --pre cltk
+	uv pip install --pre cltk
 
 installPyPITest:
 	pip install --index-url https://test.pypi.org/simple/ --no-deps cltk
 
 lint:
-	mkdir -p pylint && poetry run pylint --output-format=json cltk > pylint/pylint.json || true && poetry run pylint-json2html pylint/pylint.json 1> pylint/pylint.html
+	uv run ruff check --fix src/
+
+modelComparison:
+	@echo "Running model comparison script..."
+	uv run evaluation/compare_all_models.py
 
 notebook:
-	poetry run jupyter notebook notebooks
+	uv run jupyter notebook notebooks
 
 preCommitUpdate:
-	poetry run pre-commit autoupdate && poetry run pre-commit install --install-hooks && poetry run pre-commit autoupdate
+	uv run pre-commit autoupdate && uv run pre-commit install --install-hooks && uv run pre-commit autoupdate
 
 preCommitRun:
-	poetry run pre-commit run --all-files
+	uv run pre-commit run --all-files
 
 publishPyPI:
 	make build
-	poetry publish
+	uv publish
 
 publishPyPITest:
-	# poetry version prerelease
 	make build
-	poetry publish --repository=testpypi
+	uv publish --publish-url https://test.pypi.org/legacy/ --check-url https://test.pypi.org/simple
 
 publishPyPITestConfig:
-	poetry config repositories.testpypi https://test.pypi.org/legacy/
+	uv publish --dry-run --publish-url https://test.pypi.org/legacy/ --check-url https://test.pypi.org/simple
 
-shell:
-	echo 'Tip: Use `option ``doctest_mode`` when making doctests'
-	poetry run ipython --automagic
+simpleCheck:
+	@echo "Running simple end-to-end check of NLP("grc").analyize()..."
+	uv run scripts/example_greek_readers_guide.py
 
-test:
-	echo "Going to run all tests ..."
-	poetry run tox
+testSnapshot:
+	uv run pytest -k test_public_api_snapshot --snapshot-update
 
-testLatNLP:
-	poetry run pytest tests/test_sanity_lat_only.py
+test: typing
+	@echo "Running tests with coverage..."
+	uv run pytest --cov=cltk --cov-report=term-missing
 
-testNoInternet:
-	poetry run pytest tests/test_sanity_no_internet.py tests/test_utils.py tests/test_text.py
+testIntegration:
+	@echo "Running integration tests..."
+	uv run pytest -m integration
 
-testOnlyDocTests:
-	echo "Going to test only doctests ..."
-	echo "NOTE: wordnet.py doctests have been disabled!"
-	poetry run pytest --disable-warnings --doctest-modules --ignore=src/cltk/wordnet src/cltk/
-
-testOnlyTestsDir:
-	echo "Going to test only unit tests ..."
-	echo "NOTE: wordnet.py doctests have been disabled!"
-	poetry run pytest --disable-warnings --ignore=src/cltk/wordnet tests
+docstrCoverage:
+	@echo "Measure and report on documentation coverage in Python modules..."
+	uv run interrogate -c pyproject.toml -vv src
 
 typing:
-	poetry run mypy --check-untyped-defs --html-report .mypy_cache src/cltk
+	uv run mypy --check-untyped-defs --html-report .mypy_cache src/cltk/ evaluation/ scripts/
+
+testBuilt:
+	@set -euo pipefail; \
+	tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	echo "Building wheel into $$tmpdir/dist ..."; \
+	uv build --out-dir $$tmpdir/dist; \
+	echo "Creating temp venv at $$tmpdir/venv ..."; \
+	python3 -m venv $$tmpdir/venv; \
+	$$tmpdir/venv/bin/python -m pip install --upgrade pip >/dev/null; \
+	echo "Exporting dev requirements ..."; \
+	uv export --group development --frozen --no-emit-project --no-editable > $$tmpdir/dev-requirements.txt; \
+	echo "Installing development dependencies ..."; \
+	$$tmpdir/venv/bin/python -m pip install -r $$tmpdir/dev-requirements.txt; \
+	whl_path=$$(ls $$tmpdir/dist/cltk-*.whl); \
+	echo "Installing built wheel with all extras ..."; \
+	$$tmpdir/venv/bin/python -m pip install "$$whl_path[stanza,openai,mistral,ollama]"; \
+	echo "Running pytest against installed wheel ..."; \
+	$$tmpdir/venv/bin/python -m pytest tests
 
 uninstall:
-	poetry run pip uninstall -y cltk
+	uv pip uninstall -y cltk
 
 updateDependencies:
-	poetry update
+	uv lock --upgrade
 
-uml:
-	cd docs/ && poetry run pyreverse -o svg ../src/cltk/ && cd ../
+updateSnapshot:
+	uv run pytest -k test_public_api_snapshot --snapshot-update
 
-all: format lint typing test uml docs
-
-.PHONY: build docs
+.PHONY: build docs docsServe test typing testBuilt

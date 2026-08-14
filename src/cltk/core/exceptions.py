@@ -1,52 +1,62 @@
-"""Custom exceptions for ``cltk`` library."""
+"""Custom exceptions for the CLTK library."""
 
 
 class CLTKException(Exception):
-    """Exception class for the ``cltk`` library.
+    """Base exception class for CLTK.
 
-    >>> from cltk.core.exceptions import CLTKException
-    >>> raise CLTKException
-    Traceback (most recent call last):
-      ...
-      File "<doctest cltk.core.exceptions.CLTKException[1]>", line 1, in <module>
-        raise CLTKException
-    cltk.core.exceptions.CLTKException
+    Examples:
+        ```python
+        from cltk.core.exceptions import CLTKException
+
+        raise CLTKException()
+        ```
+
     """
 
 
 class UnimplementedAlgorithmError(CLTKException):
-    """Exception for when a language is supported by the CLTK however
-    a particular algorithm is not available for that language.
+    """Raised when a language is supported but a specific algorithm is missing.
 
-    >>> from cltk.core.exceptions import UnimplementedAlgorithmError
-    >>> raise UnimplementedAlgorithmError
-    Traceback (most recent call last):
-      ...
-      File "<doctest cltk.core.exceptions.UnimplementedAlgorithmError[1]>", line 1, in <module>
-        raise UnimplementedAlgorithmError
-    cltk.core.exceptions.UnimplementedAlgorithmError
+    Examples:
+        ```python
+        from cltk.core.exceptions import UnimplementedAlgorithmError
+
+        raise UnimplementedAlgorithmError()
+        ```
+
     """
 
 
 class UnknownLanguageError(CLTKException):
-    """Exception for when a user requests a language either not
-    known to the CLTK or not yet implemented.
+    """Raised when a user requests a language unknown or not implemented.
 
     All known languages at ``cltk.languages.glottolog.py``. Implemented
     languages include those at ``cltk.languages.pipelines`` and some
     miscellaneously implemented throughout the library.
 
-    >>> from cltk.core.exceptions import UnknownLanguageError
-    >>> raise UnknownLanguageError
-    Traceback (most recent call last):
-      ...
-      File "<doctest cltk.core.exceptions.UnknownLanguageError[1]>", line 1, in <module>
-        raise UnknownLanguageError
-    cltk.core.exceptions.UnknownLanguageError
+    Examples:
+        ```python
+        from cltk.core.exceptions import UnknownLanguageError
+
+        raise UnknownLanguageError()
+        ```
+
     """
 
 
 class CorpusImportError(Exception):
-    """CLTK exception to use when something goes wrong importing corpora"""
+    """Raised when something goes wrong importing corpora."""
+
+    pass
+
+
+class OpenAIInferenceError(CLTKException):
+    """Raised when OpenAI inference fails or returns an invalid response."""
+
+    pass
+
+
+class MistralInferenceError(CLTKException):
+    """Raised when Mistral inference fails or returns an invalid response."""
 
     pass

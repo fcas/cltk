@@ -1,39 +1,29 @@
 """Module for commonly reused classes and functions."""
 
 import os
+import re
 import sys
+import unicodedata
 from contextlib import contextmanager
-from enum import EnumMeta, IntEnum
-from typing import Any, Optional, Union
+from typing import Any, Iterator, Optional, Union
 
-import requests
-from tqdm import tqdm
-
-
-class CLTKEnumMeta(EnumMeta):
-    def __repr__(cls):
-        return cls.__name__
-
-
-class CLTKEnum(IntEnum, metaclass=CLTKEnumMeta):
-    def __repr__(self):
-        return f"{self._name_}"
-
-    __str__ = __repr__
-
-    def __eq__(self, other):
-        return False if type(self) != type(other) else IntEnum.__eq__(self, other)
+from dotenv import load_dotenv
 
 
 def file_exists(file_path: str, is_dir: bool = False) -> bool:
     """Try to expand `~/` and check if a file or dir exists.
+
     Optionally check if it's a dir.
 
-    >>> file_exists('~/fake_file')
-    False
+    Examples:
+        ```python
+        file_exists('~/fake_file')
+        # False
 
-    >>> file_exists('~/', is_dir=True)
-    True
+        file_exists('~/', is_dir=True)
+        # True
+        ```
+
     """
     file_path_expanded: str = os.path.expanduser(file_path)
     if is_dir:
@@ -42,33 +32,38 @@ def file_exists(file_path: str, is_dir: bool = False) -> bool:
 
 
 def reverse_dict(
-    input_dict: dict[str, Any],  # pylint: disable=bad-continuation
-    ignore_keys: Optional[list[str]] = None,  # pylint: disable=bad-continuation
+    input_dict: dict[str, Any],
+    ignore_keys: Optional[list[str]] = None,
 ) -> dict[str, str]:
-    """Take a dict and reverse its keys and values. Optional
-    parameter to ignore certain keys.
+    """Take a dict and reverse its keys and values.
 
-    >>> ids_lang = dict(anci1242='Ancient Greek', lati1261='Latin', unlabeled=['Ottoman'])
-    >>> reverse_dict(ids_lang, ignore_keys=['unlabeled'])
-    {'Ancient Greek': 'anci1242', 'Latin': 'lati1261'}
+    Optional parameter to ignore certain keys.
 
-    >>> reverse_dict(dict(anci1242='Ancient Greek', lati1261='Latin'))
-    {'Ancient Greek': 'anci1242', 'Latin': 'lati1261'}
+    Examples:
+        ```python
+        ids_lang = dict(anci1242='Ancient Greek', lati1261='Latin', unlabeled=['Ottoman'])
+        reverse_dict(ids_lang, ignore_keys=['unlabeled'])
+        # {'Ancient Greek': 'anci1242', 'Latin': 'lati1261'}
 
-    >>> reverse_dict(ids_lang)
-    Traceback (most recent call last):
-      ...
-    TypeError: This function can only convert type str value to a key. Received value type `<class 'list'>` for key `unlabeled` instead. Consider using `ignore_keys` for this key-value pair to be skipped.
+        reverse_dict(dict(anci1242='Ancient Greek', lati1261='Latin'))
+        # {'Ancient Greek': 'anci1242', 'Latin': 'lati1261'}
 
-    >>> reverse_dict(ids_lang, ignore_keys='unlabeled')
-    Traceback (most recent call last):
-      ...
-    TypeError: The `ignore_key` parameter must be either types None or list. Received type `<class 'str'>` instead.
+        try:
+            reverse_dict(ids_lang)
+        except TypeError:
+            pass
 
-    >>> reverse_dict(ids_lang, ignore_keys=['UNUSED-KEY'])
-    Traceback (most recent call last):
-      ...
-    TypeError: This function can only convert type str value to a key. Received value type `<class 'list'>` for key `unlabeled` instead. Consider using `ignore_keys` for this key-value pair to be skipped.
+        try:
+            reverse_dict(ids_lang, ignore_keys='unlabeled')
+        except TypeError:
+            pass
+
+        try:
+            reverse_dict(ids_lang, ignore_keys=['UNUSED-KEY'])
+        except TypeError:
+            pass
+        ```
+
     """
     if ignore_keys and not isinstance(ignore_keys, list):
         raise TypeError(
@@ -92,20 +87,21 @@ def reverse_dict(
 
 
 @contextmanager
-def suppress_stdout():
-    """Wrap a function with this to suppress
-    its printing to screen.
+def suppress_stdout() -> Iterator[None]:
+    """Wrap a function with this to suppress its printing to screen.
 
     Source: `<https://thesmithfam.org/blog/2012/10/25/temporarily-suppress-console-output-in-python/>`_.
 
-    >>> print("You can see this")
-    You can see this
+    Examples:
+        ```python
+        print("You can see this")
 
-    >>> with suppress_stdout():
-    ...     print("YY")
+        with suppress_stdout():
+            print("YY")
 
-    >>> print("And you can see this again")
-    And you can see this again
+        print("And you can see this again")
+        ```
+
     """
     with open(os.devnull, "w") as devnull:
         old_stdout = sys.stdout
@@ -117,28 +113,31 @@ def suppress_stdout():
 
 
 def get_cltk_data_dir() -> str:
-    """Defines where to look for the ``cltk_data`` dir.
+    """Return where to look for the ``cltk_data`` dir.
+
     By default, this is located in a user's home directory
     and the directory is created there (``~/cltk_data``).
     However a user may customize where this goes with
     the OS environment variable ``$CLTK_DATA``. If the
     variable is found, then its value is used.
 
-    >>> from cltk.utils import CLTK_DATA_DIR
-    >>> import os
-    >>> os.environ["CLTK_DATA"] = os.path.expanduser("~/cltk_data")
-    >>> cltk_data_dir = get_cltk_data_dir()
-    >>> os.path.split(cltk_data_dir)[1]
-    'cltk_data'
-    >>> del os.environ["CLTK_DATA"]
-    >>> os.environ["CLTK_DATA"] = os.path.expanduser("~/custom_dir")
-    >>> cltk_data_dir = os.environ.get("CLTK_DATA")
-    >>> os.path.split(cltk_data_dir)[1]
-    'custom_dir'
-    >>> del os.environ["CLTK_DATA"]
-    """
-    import os  # pylint: disable=import-outside-toplevel
+    Examples:
+        ```python
+        from cltk.utils import CLTK_DATA_DIR
+        import os
 
+        os.environ["CLTK_DATA"] = os.path.expanduser("~/cltk_data")
+        cltk_data_dir = get_cltk_data_dir()
+        assert os.path.split(cltk_data_dir)[1] == "cltk_data"
+        del os.environ["CLTK_DATA"]
+
+        os.environ["CLTK_DATA"] = os.path.expanduser("~/custom_dir")
+        cltk_data_dir = os.environ.get("CLTK_DATA")
+        assert os.path.split(cltk_data_dir)[1] == "custom_dir"
+        del os.environ["CLTK_DATA"]
+        ```
+
+    """
     if "CLTK_DATA" in os.environ:
         cltk_data_dir = os.path.expanduser(os.path.normpath(os.environ["CLTK_DATA"]))
         if not os.path.isdir(cltk_data_dir):
@@ -149,8 +148,7 @@ def get_cltk_data_dir() -> str:
             )
         if not os.access(cltk_data_dir, os.W_OK):
             raise PermissionError(
-                "Custom data directory `%s` must have "
-                "write permission." % cltk_data_dir
+                "Custom data directory `%s` must have write permission." % cltk_data_dir
             )
     else:
         cltk_data_dir = os.path.expanduser(
@@ -169,6 +167,7 @@ def str_to_bool(string: str, truths: Optional[list[str]] = None) -> bool:
     Returns:
         ``True`` if string is in truths; otherwise, returns ``False``. All strings
         are compared in lowercase, so the method is case insensitive.
+
     """
     truths = truths or ["yes", "y"]
     return string.lower() in [t.lower() for t in truths]
@@ -182,11 +181,12 @@ def query_yes_no(question: str, default: Union[str, None] = "yes") -> bool:
     Args:
         question: Question string presented to the user.
         default: Presumed answer if the user just hits <Enter>.
-           It must be "yes" (the default), "no", or None (meaning
-           an answer is required of the user).
+            It must be "yes" (the default), "no", or None (meaning
+            an answer is required of the user).
 
     Returns:
         ``True`` for "yes" and "y" or ``False`` for "no" and "n".
+
     """
     # 1. Construct prompt
     if default == "yes":
@@ -212,14 +212,16 @@ def query_yes_no(question: str, default: Union[str, None] = "yes") -> bool:
 
 
 def mk_dirs_for_file(file_path: str) -> None:
-    """Make all dirs specified for final file. If dir already exists,
-    then silently continue.
+    """Make all dirs specified for final file.
+
+    If dir already exists, then silently continue.
 
     Args:
         file_path: Paths of dirs to be created (i.e., `mkdir -p`)
 
     Returns:
         None
+
     """
     dirs = os.path.split(file_path)[0]
     try:
@@ -229,35 +231,44 @@ def mk_dirs_for_file(file_path: str) -> None:
         return None
 
 
-def get_file_with_progress_bar(model_url: str, file_path: str) -> None:
-    """Download file with a progress bar.
+def pascal_case(value: str) -> str:
+    """Convert a string to PascalCase."""
+    return capital_case(camel_case(value))
 
-    Source: https://stackoverflow.com/a/37573701
+
+def camel_case(value: str) -> str:
+    """Convert a string to camelCase, removing separators."""
+    string = re.sub(r"\w[\s\W]+\w", "", str(value))
+    if not string:
+        return string
+    return string[0].lower() + re.sub(
+        r"[\-_\.\s]([a-z])", lambda matched: matched.group(1).upper(), string[1:]
+    )
+
+
+def capital_case(value: str) -> str:
+    """Capitalize the first character of a string."""
+    return value[0].upper() + value[1:]
+
+
+def load_env_file(env_file: str = ".env") -> None:
+    """Load environment variables from a .env file.
 
     Args:
-        model_url: URL from which to downloaded file.
-        file_path: Location at which to save file.
-
-    Raises:
-        IOError: If size of downloaded file differs from that in remote's ``content-length`` header.
+        env_file: Path to the .env file. Defaults to ".env".
 
     Returns:
         None
+
     """
-    mk_dirs_for_file(file_path=file_path)
-    req_obj = requests.get(url=model_url, stream=True)
-    total_size = int(req_obj.headers.get("content-length", 0))
-    block_size = 1024  # 1 Kibibyte
-    progress_bar = tqdm(total=total_size, unit="iB", unit_scale=True)
-    with open(file_path, "wb") as file_open:
-        for data in req_obj.iter_content(block_size):
-            progress_bar.update(len(data))
-            file_open.write(data)
-    progress_bar.close()
-    if total_size != 0 and progress_bar.n != total_size:
-        raise IOError(
-            f"Expected downloaded file to be of size '{total_size}' however it is in fact '{progress_bar.n}'."
-        )
+    load_dotenv(env_file)
+
+
+def strip_accents(s: str) -> str:
+    """Remove all accent marks from a string."""
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn"
+    )
 
 
 CLTK_DATA_DIR = get_cltk_data_dir()

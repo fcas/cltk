@@ -1,58 +1,60 @@
-"""Processes for processing text."""
+"""Hold the ``Process`` for normalizing text strings.
 
-from copy import copy
-from dataclasses import dataclass
+Usually used before the text is sent to other processes.
+"""
 
-from boltons.cacheutils import cachedproperty
+from functools import cached_property
+from typing import Callable, ClassVar, Optional
 
-from cltk.core import Doc, Process
-from cltk.text.non import OldNorsePunctuationRemover
+from cltk.core.cltk_logger import bind_context, logger
+from cltk.core.data_types import Doc, Process
+from cltk.core.logging_utils import bind_from_doc
+from cltk.core.process_registry import register_process
+from cltk.text.utils import cltk_normalize
 
 
-@dataclass
-class PunctuationRemovalProcess(Process):
-    """"""
+@register_process
+class NormalizeProcess(Process):
+    """Generic process for text normalization."""
+
+    process_id: ClassVar[str] = "normalize"
+    language_code: Optional[str] = None
+
+    @cached_property
+    def algorithm(self) -> Callable[[str], str]:
+        """Return the normalization function used for this process."""
+        # TODO: Decide whether to strip out section numbers with `text = strip_section_numbers(text)`
+        bind_context(glottolog_id=self.language_code).debug(
+            f"`NormalizeProcess()`: Generic normalization for: {self.language_code}"
+        )
+        return cltk_normalize
 
     def run(self, input_doc: Doc) -> Doc:
-        punctuation_remover: PunctuationRemovalProcess = self.algorithm
-
-        output_doc = copy(input_doc)
-        output_doc.words = [
-            word for word in output_doc.words if not punctuation_remover(word)
-        ]
-        return output_doc
-
-
-class DefaultPunctuationRemovalProcess(PunctuationRemovalProcess):
-    description: str = "Default punctuation removal algorithm"
-
-    @cachedproperty
-    def algorithm(self):
-        return DefaultPunctuationRemover()
-
-
-DEFAULT_PUNCTUATION: list[str] = [".", ",", ";", ":", '"', "'", "!", "?"]
-
-
-class DefaultPunctuationRemover:
-    """DefaultPunctuationRemover"""
-
-    def __init__(self):
-        pass
-
-    def filter(self, word) -> bool:
-        return word.string in DEFAULT_PUNCTUATION
-
-    def __repr__(self) -> str:
-        return f"<DefaultPunctuationRemover>"
-
-    def __call__(self, word) -> bool:
-        return self.filter(word)
+        """Invoke language-appropriate normalization code for text a given language."""
+        log = bind_from_doc(input_doc)
+        log.debug(f"Running normalization for language: {self.language_code}")
+        if self.algorithm is None:
+            log.error(
+                f"No normalization algorithm found for language '{self.language_code}'"
+            )
+            raise ValueError(
+                f"No normalization algorithm found for language '{self.language_code}'"
+            )
+        if input_doc.raw is None:
+            log.error("input_doc.raw must not be None")
+            raise ValueError("input_doc.raw must not be None")
+        normalized_text = self.algorithm(input_doc.raw)
+        input_doc.normalized_text = normalized_text
+        log.info(
+            f"Normalized text: {input_doc.normalized_text[:50]}..."
+            if input_doc.normalized_text
+            else "Normalized text is empty."
+        )
+        return input_doc
 
 
-class OldNorsePunctuationRemovalProcess(PunctuationRemovalProcess):
-    description: str = "Default Old Norse punctuation removal algorithm"
+class MultilingualNormalizeProcess(NormalizeProcess):
+    """Text normalization for multiple languages."""
 
-    @cachedproperty
-    def algorithm(self) -> OldNorsePunctuationRemover:
-        return OldNorsePunctuationRemover()
+    def __post_init__(self) -> None:
+        logger.debug("MultilingualNormalizeProcess initialized.")

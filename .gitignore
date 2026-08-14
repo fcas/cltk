@@ -1,5 +1,8 @@
 # Misc.
-*.txt
+notebooks/*.txt
+*.out
+temp*
+temp_*
 
 # Jupyter
 *.ipynb
@@ -11,9 +14,12 @@ notebooks/doc.pickle
 
 # UML created by pyreverse
 *.png
+# Keep documentation images tracked
+!docs/**/*.png
 
 # IDE
 .idea
+.vscode
 
 # Sourcetrail
 *.srctrlbm
@@ -115,6 +121,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+*venv*
 
 # Spyder project settings
 .spyderproject
@@ -128,3 +135,7 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+.mypy_cache
+
+# Rudd
+.ruff_cache

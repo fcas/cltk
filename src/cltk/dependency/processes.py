@@ -1,348 +1,968 @@
-"""``Process`` classes for accessing the Stanza project."""
+"""Processes of POS and feature tagging."""
 
+from collections.abc import Callable
 from copy import copy
-from dataclasses import dataclass
-from typing import Any, Literal, Optional
+from functools import cached_property
+from typing import ClassVar, Optional
 
-import spacy
-import stanza
-from boltons.cacheutils import cachedproperty
-
-from cltk.core.data_types import Doc, MorphosyntacticFeature, Process, Word
-from cltk.dependency.spacy_wrapper import SpacyWrapper
-from cltk.dependency.stanza_wrapper import StanzaWrapper
-from cltk.dependency.tree import DependencyTree
-from cltk.morphology.morphosyntax import (
-    MorphosyntacticFeatureBundle,
-    from_ud,
-    to_categorial,
+from cltk.core.cltk_logger import bind_context
+from cltk.core.data_types import Doc, Process
+from cltk.core.logging_utils import bind_from_doc
+from cltk.core.process_registry import register_process
+from cltk.dependency.utils import (
+    generate_gpt_dependency_concurrent,
 )
+from cltk.genai.prompt_registry import (
+    PromptProfileRegistry,
+    PromptTemplate,
+    build_prompt_info,
+)
+from cltk.genai.prompts import PromptInfo
+
+# Prompt overrides can be callables, PromptInfo, or literal strings.
+PromptBuilder = Callable[[str, str], PromptInfo] | PromptInfo | str
 
 
-@dataclass
-class StanzaProcess(Process):
-    """A ``Process`` type to capture everything
-    that the ``stanza`` project can do for a
-    given language.
-
-    .. note::
-        ``stanza`` has only partial functionality available for some languages.
-
-    >>> from cltk.languages.example_texts import get_example_text
-    >>> process_stanza = StanzaProcess(language="lat")
-    >>> isinstance(process_stanza, StanzaProcess)
-    True
-    >>> from stanza.models.common.doc import Document
-    >>> output_doc = process_stanza.run(Doc(raw=get_example_text("lat")))
-    >>> isinstance(output_doc.stanza_doc, Document)
-    True
-    """
-
-    language: str = None
-
-    @cachedproperty
-    def algorithm(self):
-        return StanzaWrapper.get_nlp(language=self.language)
-
-    def run(self, input_doc: Doc) -> Doc:
-        output_doc = copy(input_doc)
-        stanza_wrapper = self.algorithm
-        if output_doc.normalized_text:
-            input_text = output_doc.normalized_text
-        else:
-            input_text = output_doc.raw
-        stanza_doc = stanza_wrapper.parse(input_text)
-        cltk_words = self.stanza_to_cltk_word_type(stanza_doc)
-        output_doc.words = cltk_words
-        output_doc.stanza_doc = stanza_doc
-
-        return output_doc
-
-    @staticmethod
-    def stanza_to_cltk_word_type(stanza_doc):
-        """Take an entire ``stanza`` document, extract
-        each word, and encode it in the way expected by
-        the CLTK's ``Word`` type.
-
-        >>> from cltk.dependency.processes import StanzaProcess
-        >>> from cltk.languages.example_texts import get_example_text
-        >>> process_stanza = StanzaProcess(language="lat")
-        >>> cltk_words = process_stanza.run(Doc(raw=get_example_text("lat"))).words
-        >>> isinstance(cltk_words, list)
-        True
-        >>> isinstance(cltk_words[0], Word)
-        True
-        >>> cltk_words[0]
-         Word(index_char_start=None, index_char_stop=None, index_token=0, index_sentence=0, string='Gallia', pos=noun, lemma='Gallia', stem=None, scansion=None, xpos='A1|grn1|casA|gen2', upos='NOUN', dependency_relation='nsubj', governor=1, features={Case: [nominative], Gender: [feminine], InflClass: [ind_eur_a], Number: [singular]}, category={F: [neg], N: [pos], V: [neg]}, stop=None, named_entity=None, syllables=None, phonetic_transcription=None, definition=None)
-
-        """
-
-        words_list: list[Word] = list()
-
-        for sentence_index, sentence in enumerate(stanza_doc.sentences):
-            sent_words: dict[int, Word] = dict()
-            indices: list[tuple[int, int]] = list()
-
-            for token_index, token in enumerate(sentence.tokens):
-                stanza_word: stanza.pipeline.doc.Word = token.words[0]
-                # TODO: Figure out how to handle the token indexes, esp 0 (root) and None (?)
-                pos: Optional[MorphosyntacticFeature] = None
-                if stanza_word.pos:
-                    pos = from_ud("POS", stanza_word.pos)
-                cltk_word = Word(
-                    index_token=int(stanza_word.id)
-                    - 1,  # subtract 1 from id b/c Stanza starts their index at 1
-                    index_sentence=sentence_index,
-                    string=stanza_word.text,  # same as ``token.text``
-                    pos=pos,
-                    xpos=stanza_word.xpos,
-                    upos=stanza_word.upos,
-                    lemma=stanza_word.lemma if stanza_word.lemma else stanza_word.text,
-                    dependency_relation=stanza_word.deprel,
-                    governor=stanza_word.head - 1
-                    if stanza_word.head
-                    else -1,  # note: if val becomes ``-1`` then no governor, ie word is root
-                )
-
-                # convert UD features to the normalized CLTK features
-                raw_features = (
-                    [tuple(f.split("=")) for f in stanza_word.feats.split("|")]
-                    if stanza_word.feats
-                    else []
-                )
-
-                cltk_features = [
-                    from_ud(feature_name, feature_value)
-                    for feature_name, feature_value in raw_features
-                ]
-                cltk_word.features = MorphosyntacticFeatureBundle(*cltk_features)
-                cltk_word.category = to_categorial(cltk_word.pos)
-                cltk_word.stanza_features = stanza_word.feats
-
-                # sent_words[cltk_word.index_token] = cltk_word
-                words_list.append(cltk_word)
-
-                # # TODO: Fix this, I forget what we were tracking in this
-                # indices.append(
-                #     (
-                #         int(stanza_word.governor)
-                #         - 1,  # -1 to match CLTK Word.index_token
-                #         int(stanza_word.parent_token.index)
-                #         - 1,  # -1 to match CLTK Word.index_token
-                #     )
-                # )
-            # # TODO: Confirm that cltk_word.parent is ever getting filled out. Only for some lang models?
-            # for idx, cltk_word in enumerate(sent_words.values()):
-            #     governor_index, parent_index = indices[idx]  # type: int, int
-            #     cltk_word.governor = governor_index if governor_index >= 0 else None
-            #     if cltk_word.index_token != sent_words[parent_index].index_token:
-            #         cltk_word.parent = parent_index
-
-        return words_list
+class DependencyProcess(Process):
+    """Base class for morphosyntactic processes."""
 
 
-@dataclass
-class GreekStanzaProcess(StanzaProcess):
-    """Stanza processor for Ancient Greek."""
+@register_process
+class GenAIDependencyProcess(DependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
 
-    language: str = "grc"
-    description: str = "Default process for Stanza for the Ancient Greek language."
-    authorship_info: str = "``LatinSpacyProcess`` using Stanza model by Stanford University from https://stanfordnlp.github.io/stanza/ . Please cite: https://arxiv.org/abs/2003.07082"
+    process_id: ClassVar[str] = "dependency.genai"
+    # Optional prompt builders for custom pipelines
+    prompt_builder_from_tokens: Optional[PromptBuilder] = None
+    prompt_builder_from_text: Optional[PromptBuilder] = None
+    prompt_profile: Optional[str] = None
+    prompt_version: Optional[str] = None
 
-
-@dataclass
-class LatinStanzaProcess(StanzaProcess):
-    """Stanza processor for Latin."""
-
-    language: str = "lat"
-    description: str = "Default process for Stanza for the Latin language."
-
-
-@dataclass
-class OCSStanzaProcess(StanzaProcess):
-    """Stanza processor for Old Church Slavonic."""
-
-    language: str = "chu"
-    description: str = (
-        "Default process for Stanza for the Old Church Slavonic language."
-    )
-
-
-@dataclass
-class OldFrenchStanzaProcess(StanzaProcess):
-    """Stanza processor for Old French."""
-
-    language: str = "fro"
-    description: str = "Default process for Stanza for the Old French language."
-
-
-@dataclass
-class GothicStanzaProcess(StanzaProcess):
-    """Stanza processor for Gothic."""
-
-    language: str = "got"
-    description: str = "Default process for Stanza for the Gothic language."
-
-
-@dataclass
-class CopticStanzaProcess(StanzaProcess):
-    """Stanza processor for Coptic."""
-
-    language: str = "cop"
-    description: str = "Default process for Stanza for the Coptic language."
-
-
-@dataclass
-class ChineseStanzaProcess(StanzaProcess):
-    """Stanza processor for Classical Chinese."""
-
-    language: str = "lzh"
-    description: str = "Default process for Stanza for the Classical Chinese language."
-
-
-class TreeBuilderProcess(Process):
-    """A ``Process`` that takes a doc containing sentences of CLTK words
-    and returns a dependency tree for each sentence.
-
-    TODO: JS help to make this work, illustrate better.
-
-    >>> from cltk import NLP
-    >>> nlp = NLP(language="got", suppress_banner=True)
-    >>> from cltk.dependency.processes import TreeBuilderProcess
-
-    >>> nlp.pipeline.add_process(TreeBuilderProcess)  # doctest: +SKIP
-    >>> from cltk.languages.example_texts import get_example_text  # doctest: +SKIP
-    >>> doc = nlp.analyze(text=get_example_text("got"))  # doctest: +SKIP
-    >>> len(doc.trees)  # doctest: +SKIP
-    4
-    """
-
-    def algorithm(self, doc):
-        doc.trees = [DependencyTree.to_tree(sentence) for sentence in doc.sentences]
-        return doc
-
-
-@dataclass
-class SpacyProcess(Process):
-    """A ``Process`` type to capture everything, that the ``spaCy`` project can do for a given language.
-
-    .. note::
-        ``spacy`` has only partial functionality available for some languages.
-
-    >>> from cltk.languages.example_texts import get_example_text
-    >>> process_spacy = SpacyProcess(language="lat")
-    >>> isinstance(process_spacy, SpacyProcess)
-    True
-
-    # >>> from spacy.models.common.doc import Document
-    # >>> output_doc = process_spacy.run(Doc(raw=get_example_text("lat")))
-    # >>> isinstance(output_doc.spacy_doc, Document)
-    True
-    """
-
-    # language: Optional[str] = None
-
-    @cachedproperty
-    def algorithm(self):
-        return SpacyWrapper.get_nlp(language=self.language)
+    @cached_property
+    def algorithm(self) -> Callable[..., Doc]:
+        """Return the dependency generation function for this process."""
+        if not self.glottolog_id:
+            msg: str = "glottolog_id must be set for DependencyProcess"
+            bind_context(glottolog_id=self.glottolog_id).error(msg)
+            raise ValueError(msg)
+        # Prefer the safe concurrent wrapper (async under the hood, sync surface)
+        return generate_gpt_dependency_concurrent
 
     def run(self, input_doc: Doc) -> Doc:
+        """Run the configured GPT dependency parsing workflow."""
         output_doc = copy(input_doc)
-        spacy_wrapper = self.algorithm
-        if output_doc.normalized_text:
-            input_text = output_doc.normalized_text
-        else:
-            input_text = output_doc.raw
-        spacy_doc = spacy_wrapper.parse(input_text)
-        cltk_words = self.spacy_to_cltk_word_type(spacy_doc)
-        output_doc.words = cltk_words
-        output_doc.spacy_doc = spacy_doc
+        if not output_doc.normalized_text:
+            msg: str = "Doc must have `normalized_text`."
+            bind_from_doc(output_doc).error(msg)
+            raise ValueError(msg)
+        # Ensure required attributes are present
+        if self.glottolog_id is None:
+            raise ValueError("glottolog_id must be set for sentence splitting")
+        prompt_builder_from_tokens = self.prompt_builder_from_tokens
+        prompt_builder_from_text = self.prompt_builder_from_text
+        prompt_digest = None
+        if self.prompt_profile and (
+            prompt_builder_from_tokens is None or prompt_builder_from_text is None
+        ):
+            template = PromptProfileRegistry.get_prompt(
+                self.prompt_profile, self.process_id, self.prompt_version
+            )
+            prompt_digest = template.digest
+            if prompt_builder_from_tokens is None:
 
+                def _builder_tokens(
+                    lang: str, table: str, _template: PromptTemplate = template
+                ) -> PromptInfo:
+                    """Build a dependency prompt from tokens via a profile template."""
+                    return build_prompt_info(
+                        _template,
+                        variant="tokens",
+                        lang_or_dialect_name=lang,
+                        token_table=table,
+                        text=table,
+                        sentence=table,
+                    )
+
+                prompt_builder_from_tokens = _builder_tokens
+            if prompt_builder_from_text is None:
+
+                def _builder_text(
+                    lang: str, sentence: str, _template: PromptTemplate = template
+                ) -> PromptInfo:
+                    """Build a dependency prompt from text via a profile template."""
+                    return build_prompt_info(
+                        _template,
+                        variant="text",
+                        lang_or_dialect_name=lang,
+                        sentence=sentence,
+                        text=sentence,
+                        token_table=sentence,
+                    )
+
+                prompt_builder_from_text = _builder_text
+        # Callable typing does not retain keyword names; pass positionally
+        output_doc = self.algorithm(
+            output_doc,
+            prompt_builder_from_tokens=prompt_builder_from_tokens,
+            prompt_builder_from_text=prompt_builder_from_text,
+            prompt_profile=self.prompt_profile,
+            prompt_digest=prompt_digest,
+            provenance_process=f"{self.process_id}:{self.__class__.__name__}",
+        )
         return output_doc
 
-    @staticmethod
-    def spacy_to_cltk_word_type(spacy_doc: spacy.tokens.doc.Doc):
-        """Take an entire ``spacy`` document, extract
-        each word, and encode it in the way expected by
-        the CLTK's ``Word`` type.
 
-        It works only if there is some sentence boundaries has been set by the loaded model.
+class CuneiformLuwianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
 
-        See note in code about starting word token index at 1
-
-        >>> from cltk.dependency.processes import SpacyProcess
-        >>> from cltk.languages.example_texts import get_example_text
-        >>> process_spacy = SpacyProcess(language="lat")
-        >>> cltk_words = process_spacy.run(Doc(raw=get_example_text("lat"))).words
-        >>> isinstance(cltk_words, list)
-        True
-        >>> isinstance(cltk_words[0], Word)
-        True
-        >>> cltk_words[0]
-        Word(index_char_start=0, index_char_stop=6, index_token=0, index_sentence=0, string='Gallia', pos=None, lemma='Gallia', stem=None, scansion=None, xpos='proper_noun', upos='PROPN', dependency_relation='nsubj', governor=None, features={}, category={}, stop=False, named_entity=None, syllables=None, phonetic_transcription=None, definition=None)
-
-        """
-        words_list: list[Word] = []
-        for sentence_index, sentence in enumerate(spacy_doc.doc.sents):
-            sent_words: dict[int, Word] = {}
-            for spacy_word in sentence:
-                pos: Optional[MorphosyntacticFeature] = None
-                if spacy_word.pos_:
-                    pos = from_ud("POS", spacy_word.pos_)
-                cltk_word = Word(
-                    # Note: In order to match how Stanza orders token output
-                    # (index starting at 1, not 0), we must add an extra 1 to each
-                    index_token=spacy_word.i + 1,
-                    index_char_start=spacy_word.idx,
-                    index_char_stop=spacy_word.idx + len(spacy_word),
-                    index_sentence=sentence_index,
-                    string=spacy_word.text,  # same as ``token.text``
-                    pos=pos,
-                    xpos=spacy_word.tag_,
-                    upos=spacy_word.pos_,
-                    lemma=spacy_word.lemma_,
-                    dependency_relation=spacy_word.dep_,  # str
-                    stop=spacy_word.is_stop,
-                    # Note: Must increment this, too
-                    governor=spacy_word.head.i + 1,  # TODO: Confirm this is the index
-                )
-                raw_features: list[tuple[str, str]] = (
-                    [
-                        (feature, value)
-                        for feature, value in spacy_word.morph.to_dict().items()
-                    ]
-                    if spacy_word.morph
-                    else []
-                )
-                cltk_features = [
-                    from_ud(feature_name, feature_value)
-                    for feature_name, feature_value in raw_features
-                ]
-                cltk_word.features = MorphosyntacticFeatureBundle(*cltk_features)
-                cltk_word.category = to_categorial(cltk_word.pos)
-                sent_words[cltk_word.index_token] = cltk_word
-                words_list.append(cltk_word)
-        return words_list
+    glottolog_id: Optional[str] = "cune1239"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Cuneiform Luwian language."
+    authorship_info: str = "CLTK"
 
 
-@dataclass
-class LatinSpacyProcess(SpacyProcess):
-    """Run a Spacy model.
+class HieroglyphicLuwianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
 
-    <https://huggingface.co/latincy>_
-    """
+    glottolog_id: Optional[str] = "hier1240"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Hieroglyphic Luwian language."
+    authorship_info: str = "CLTK"
 
-    language: Literal["lat"] = "lat"
-    description: str = "Process for Spacy for Patrick Burn's Latin model."
-    authorship_info: str = "``LatinSpacyProcess`` using LatinCy model by Patrick Burns from https://huggingface.co/latincy . Please cite: https://arxiv.org/abs/2305.04365"
 
-@dataclass
-class GreekSpacyProcess(SpacyProcess):
-    """Run a Spacy model.
+class OldPrussianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
 
-    <https://huggingface.co/chcaa>_
-    """
+    glottolog_id: Optional[str] = "prus1238"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Old Prussian language."
+    authorship_info: str = "CLTK"
 
-    language: Literal["grc"] = "grc"
-    description: str = "Process for Spacy for OdyCy's Greek model."
-    authorship_info: str = "``GreekSpacyProcess`` using OdyCy model by Center for Humanities Computing Aarhus from https://huggingface.co/chcaa . Please cite: https://aclanthology.org/2023.latechclfl-1.14"
+
+class LithuanianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "lith1251"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Lithuanian language."
+    authorship_info: str = "CLTK"
+
+
+class LatvianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "latv1249"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Latvian language."
+    authorship_info: str = "CLTK"
+
+
+class AlbanianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "gheg1238"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Albanian language."
+    authorship_info: str = "CLTK"
+
+
+class AkkadianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "akka1240"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Akkadian language."
+    authorship_info: str = "CLTK"
+
+
+class AncientGreekGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "anci1242"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Ancient Greek language."
+    authorship_info: str = "CLTK"
+
+
+class BiblicalHebrewGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "anci1244"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Biblical Hebrew language."
+    authorship_info: str = "CLTK"
+
+
+class ClassicalArabicGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "clas1259"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Classical Arabic language."
+    authorship_info: str = "CLTK"
+
+
+class AvestanGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "aves1237"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Avestan language."
+    authorship_info: str = "CLTK"
+
+
+class BactrianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "bact1239"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Bactrian language."
+    authorship_info: str = "CLTK"
+
+
+class SogdianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "sogd1245"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Sogdian language."
+    authorship_info: str = "CLTK"
+
+
+class BengaliGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "beng1280"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Bengali language."
+    authorship_info: str = "CLTK"
+
+
+class CarianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "cari1274"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Carian language."
+    authorship_info: str = "CLTK"
+
+
+class ChurchSlavicGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "chur1257"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Church Slavic language."
+    authorship_info: str = "CLTK"
+
+
+class ClassicalArmenianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "clas1256"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Classical Armenian language."
+    authorship_info: str = "CLTK"
+
+
+class ClassicalMandaicGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "clas1253"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Classical Mandaic language."
+    authorship_info: str = "CLTK"
+
+
+class ClassicalMongolianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "mong1331"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Classical Mongolian language."
+    authorship_info: str = "CLTK"
+
+
+class ClassicalSyriacGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "clas1252"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Classical Syriac language."
+    authorship_info: str = "CLTK"
+
+
+class ClassicalTibetanGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "clas1254"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Classical Tibetan language."
+    authorship_info: str = "CLTK"
+
+
+class CopticGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "copt1239"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Coptic language."
+    authorship_info: str = "CLTK"
+
+
+class DemoticGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "demo1234"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Demotic language."
+    authorship_info: str = "CLTK"
+
+
+class EasternPanjabiGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "panj1256"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Eastern Panjabi language."
+    authorship_info: str = "CLTK"
+
+
+class EdomiteGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "edom1234"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Edomite language."
+    authorship_info: str = "CLTK"
+
+
+class GeezGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "geez1241"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Geez language."
+    authorship_info: str = "CLTK"
+
+
+class GothicGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "goth1244"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Gothic language."
+    authorship_info: str = "CLTK"
+
+
+class GujaratiGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "guja1252"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Gujarati language."
+    authorship_info: str = "CLTK"
+
+
+class HindiGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "hind1269"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Hindi language."
+    authorship_info: str = "CLTK"
+
+
+class KhariBoliGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "khad1239"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Khari Boli dialect of Hindi."
+    authorship_info: str = "CLTK"
+
+
+class BrajGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "braj1242"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Braj Bhasha language."
+    authorship_info: str = "CLTK"
+
+
+class AwadhiGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "awad1243"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Awadhi language."
+    authorship_info: str = "CLTK"
+
+
+class HittiteGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "hitt1242"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Hittite language."
+    authorship_info: str = "CLTK"
+
+
+class KhotaneseGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "khot1251"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Khotanese language."
+    authorship_info: str = "CLTK"
+
+
+class TumshuqeseGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "tums1237"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Tumshuqese language."
+    authorship_info: str = "CLTK"
+
+
+class LateEgyptianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "late1256"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Late Egyptian language."
+    authorship_info: str = "CLTK"
+
+
+class LatinGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "lati1261"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Latin language."
+    authorship_info: str = "CLTK"
+
+
+class LiteraryChineseGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "lite1248"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Literary Chinese language."
+    authorship_info: str = "CLTK"
+
+
+class LycianAGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "lyci1241"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Lycian A language."
+    authorship_info: str = "CLTK"
+
+
+class LydianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "lydi1241"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Lydian language."
+    authorship_info: str = "CLTK"
+
+
+class MaharastriPrakritGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "maha1305"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Maharastri Prakrit language."
+    authorship_info: str = "CLTK"
+
+
+class MiddleArmenianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "midd1364"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Middle Armenian language."
+    authorship_info: str = "CLTK"
+
+
+class MiddleBretonGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "oldb1244"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Middle Breton language."
+    authorship_info: str = "CLTK"
+
+
+class MiddleChineseGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "midd1344"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Middle Chinese language."
+    authorship_info: str = "CLTK"
+
+
+class MiddleCornishGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "corn1251"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Middle Cornish language."
+    authorship_info: str = "CLTK"
+
+
+class MiddleEgyptianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "midd1369"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Middle Egyptian language."
+    authorship_info: str = "CLTK"
+
+
+class MiddleEnglishGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "midd1317"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Middle English language."
+    authorship_info: str = "CLTK"
+
+
+class MiddleFrenchGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "midd1316"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Middle French language."
+    authorship_info: str = "CLTK"
+
+
+class MiddleHighGermanGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "midd1343"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Middle High German language."
+    authorship_info: str = "CLTK"
+
+
+class MiddleMongolGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "mong1329"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Middle Mongol language."
+    authorship_info: str = "CLTK"
+
+
+class MoabiteGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "moab1234"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Moabite language."
+    authorship_info: str = "CLTK"
+
+
+class OdiaGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "oriy1255"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Odia language."
+    authorship_info: str = "CLTK"
+
+
+class OfficialAramaicGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "impe1235"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Official Aramaic (700-300 BCE) language."
+    authorship_info: str = "CLTK"
+
+
+class OldBurmeseGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "oldb1235"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Old Burmese language."
+    authorship_info: str = "CLTK"
+
+
+class OldChineseGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "oldc1244"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Old Chinese language."
+    authorship_info: str = "CLTK"
+
+
+class BaihuaChineseGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "clas1255"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for Early Vernacular Chinese (Baihua)."
+    authorship_info: str = "CLTK"
+
+
+class ClassicalBurmeseGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "nucl1310"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Classical Burmese language."
+    authorship_info: str = "CLTK"
+
+
+class TangutGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "tang1334"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Tangut (Xixia) language."
+    authorship_info: str = "CLTK"
+
+
+class NewarGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "newa1246"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Newar (Classical Nepal Bhasa) language."
+    authorship_info: str = "CLTK"
+
+
+class MeiteiGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "mani1292"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Meitei (Classical Manipuri) language."
+    authorship_info: str = "CLTK"
+
+
+class SgawKarenGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "sgaw1245"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Sgaw Karen language."
+    authorship_info: str = "CLTK"
+
+
+class MogholiGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "mogh1245"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Mogholi (Moghol) language."
+    authorship_info: str = "CLTK"
+
+
+class NumidianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "numi1241"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Numidian (Ancient Berber) language."
+    authorship_info: str = "CLTK"
+
+
+class TaitaGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "tait1247"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Cushitic Taita language."
+    authorship_info: str = "CLTK"
+
+
+class HausaGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "haus1257"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Hausa language."
+    authorship_info: str = "CLTK"
+
+
+class OldJurchenGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "jurc1239"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Old Jurchen language."
+    authorship_info: str = "CLTK"
+
+
+class OldJapaneseGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "japo1237"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Old Japanese language."
+    authorship_info: str = "CLTK"
+
+
+class OldHungarianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "oldh1242"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Old Hungarian language."
+    authorship_info: str = "CLTK"
+
+
+class ChagataiGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "chag1247"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Chagatai language."
+    authorship_info: str = "CLTK"
+
+
+class OldTurkicGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "oldu1238"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Old Turkic language."
+    authorship_info: str = "CLTK"
+
+
+class OldTamilGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "oldt1248"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Old Tamil language."
+    authorship_info: str = "CLTK"
+
+
+class AmmoniteGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "ammo1234"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Ammonite language."
+    authorship_info: str = "CLTK"
+
+
+class OldAramaicGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "olda1246"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Old Aramaic (up to 700 BCE) language."
+    authorship_info: str = "CLTK"
+
+
+class OldAramaicSamalianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "olda1245"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Old Aramaic–Samʾalian language."
+    authorship_info: str = "CLTK"
+
+
+class MiddleAramaicGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "midd1366"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Middle Aramaic language."
+    authorship_info: str = "CLTK"
+
+
+class HatranGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "hatr1234"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Hatran language."
+    authorship_info: str = "CLTK"
+
+
+class JewishBabylonianAramaicGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "jewi1240"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Jewish Babylonian Aramaic language."
+    authorship_info: str = "CLTK"
+
+
+class SamalianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "sama1234"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Samʾalian language."
+    authorship_info: str = "CLTK"
+
+
+class OldEgyptianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "olde1242"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Old Egyptian language."
+    authorship_info: str = "CLTK"
+
+
+class OldEnglishGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "olde1238"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Old English (ca. 450-1100) language."
+    authorship_info: str = "CLTK"
+
+
+class OldFrenchGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "oldf1239"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Old French (842-ca. 1400) language."
+    authorship_info: str = "CLTK"
+
+
+class OldHighGermanGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "oldh1241"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Old High German (ca. 750-1050) language."
+    authorship_info: str = "CLTK"
+
+
+class EarlyIrishGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "oldi1245"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Old Irish language."
+    authorship_info: str = "CLTK"
+
+
+class MarathiGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "mara1378"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Marathi language."
+    authorship_info: str = "CLTK"
+
+
+class OldNorseGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "oldn1244"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Old Norse language."
+    authorship_info: str = "CLTK"
+
+
+class OldPersianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "oldp1254"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Old Persian (ca. 600-400 B.C.) language."
+    authorship_info: str = "CLTK"
+
+
+class OldMiddleWelshGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "oldw1239"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Old-Middle Welsh language."
+    authorship_info: str = "CLTK"
+
+
+class ParthianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "part1239"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Parthian language."
+    authorship_info: str = "CLTK"
+
+
+class MiddlePersianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "pahl1241"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Middle Persian language."
+    authorship_info: str = "CLTK"
+
+
+class PalaicGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "pala1331"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Palaic language."
+    authorship_info: str = "CLTK"
+
+
+class PaliGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "pali1273"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Pali language."
+    authorship_info: str = "CLTK"
+
+
+class PhoenicianGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "phoe1239"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Phoenician language."
+    authorship_info: str = "CLTK"
+
+
+class PunjabiGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "panj1256"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Punjabi language."
+    authorship_info: str = "CLTK"
+
+
+class AssameseGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "assa1263"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Assamese language."
+    authorship_info: str = "CLTK"
+
+
+class SinhalaGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "sinh1246"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Sinhala language."
+    authorship_info: str = "CLTK"
+
+
+class SindhiGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "sind1272"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Sindhi language."
+    authorship_info: str = "CLTK"
+
+
+class KashmiriGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "kash1277"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Kashmiri language."
+    authorship_info: str = "CLTK"
+
+
+class BagriGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "bagr1243"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Bagri (Rajasthani) language."
+    authorship_info: str = "CLTK"
+
+
+class ClassicalSanskritGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "clas1258"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Classical Sanskrit language."
+    authorship_info: str = "CLTK"
+
+
+class VedicSanskritGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "vedi1234"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Vedic Sanskrit language."
+    authorship_info: str = "CLTK"
+
+
+class TokharianAGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "toch1238"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Tokharian A language."
+    authorship_info: str = "CLTK"
+
+
+class TokharianBGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "toch1237"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Tokharian B language."
+    authorship_info: str = "CLTK"
+
+
+class UgariticGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "ugar1238"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Ugaritic language."
+    authorship_info: str = "CLTK"
+
+
+class UrduGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "urdu1245"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Urdu language."
+    authorship_info: str = "CLTK"
+
+
+class SauraseniPrakritGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "saur1252"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Sauraseni Prakrit language."
+    authorship_info: str = "CLTK"
+
+
+class MagadhiPrakritGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "maga1260"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Magadhi Prakrit language."
+    authorship_info: str = "CLTK"
+
+
+class GandhariGenAIDependencyProcess(GenAIDependencyProcess):
+    """Language-specific dependency process using a generative GPT model."""
+
+    glottolog_id: Optional[str] = "gand1259"
+    description: str = "Default dependency syntax parsing process using a generative GPT model for the Gandhari language."
+    authorship_info: str = "CLTK"

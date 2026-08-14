@@ -1,2 +1,0 @@
-"""Old Norse phonology
-"""
